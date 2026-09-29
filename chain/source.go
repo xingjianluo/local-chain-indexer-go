@@ -60,11 +60,11 @@ func MakeBlock(parent Block, txs ...Tx) Block {
 	return b
 }
 
-// MakeTx 构造一笔 ID 确定的交易。
-func MakeTx(seed byte, from, to string, amount int64) Tx {
+// MakeTx 构造一笔 ID 确定的交易；seed 在同一测试链内应唯一。
+func MakeTx(seed uint32, from, to string, amount int64) Tx {
 	var id Hash
-	id[0] = seed
-	id[31] = seed + 1
+	binary.BigEndian.PutUint32(id[:4], seed)
+	id[31] = byte(seed) + 1
 	return Tx{ID: id, From: from, To: to, Amount: amount}
 }
 

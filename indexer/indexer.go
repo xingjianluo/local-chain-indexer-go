@@ -158,31 +158,61 @@ func (ix *Indexer) ApplyBlock(b chain.Block) error {
 // 用完必须 Close。
 func (ix *Indexer) Snapshot() *snapshot { return ix.st.snapshot() }
 
-// CatchUp 从 source 追赶积压：从当前索引高度+1 起按批拉取区块，
-// 每批最多 batchSize 个（内存占用有界），直到追上 source 的 Tip
-// 或 ctx 取消。返回本次追赶应用的区块数。
+// CatchUp 从 source 追赶积压：先回退找到与源一致的分叉点，
+// 再从分叉点+1 起按批拉取区块，每批最多 batchSize 个
+// （内存占用有界），直到本地 tip 与源一致或 ctx 取消。
+// 源在中断期间发生重组时，拉取的新链块会走侧链路径并触发重组。
+// 返回本次追赶应用的区块数。
 func (ix *Indexer) CatchUp(ctx context.Context, source chain.BlockSource, batchSize int) (int, error) {
 	if batchSize <= 0 {
 		batchSize = defaultBatchSize
 	}
 	total := 0
+	var next uint64 // 拉取游标：已拉过的高度不重复拉
+	var haveNext bool
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
+		// 找分叉点：从本地 tip 回退到与源规范链一致的高度。
 		sn := ix.st.snapshot()
-		tipH, _, _ := sn.Tip()
-		sn.Close()
-		srcTipH, _ := source.Tip()
-		if tipH >= srcTipH {
-			return total, nil
+		tipH, tipHash, _ := sn.Tip()
+		forkH := tipH
+		for forkH > 0 {
+			srcBlk, ok := source.BlockByHeight(forkH)
+			if !ok {
+				forkH-- // 源在该高度暂无块，继续回退
+				continue
+			}
+			local, _ := sn.BlockAt(forkH)
+			if local.Hash == srcBlk.Hash {
+				break
+			}
+			forkH--
 		}
-		end := tipH + uint64(batchSize)
+		sn.Close()
+
+		srcTipH, srcTipHash := source.Tip()
+		if tipHash == srcTipHash {
+			return total, nil // 已追平
+		}
+		if forkH == tipH && tipH >= srcTipH {
+			return total, nil // 与源一致且不落后
+		}
+		if forkH != tipH {
+			ix.logf("[indexer] 检测到源重组：本地 tip h=%d 与源分叉，共同祖先 h=%d", tipH, forkH)
+		}
+		if !haveNext || next < forkH+1 {
+			next = forkH + 1 // 分叉点回退时游标随之回退
+		}
+		haveNext = true
+
+		end := next + uint64(batchSize) - 1
 		if end > srcTipH {
 			end = srcTipH
 		}
 		applied := 0
-		for h := tipH + 1; h <= end; h++ {
+		for h := next; h <= end; h++ {
 			blk, ok := source.BlockByHeight(h)
 			if !ok {
 				break // 源侧链变化，跳出重估
@@ -196,9 +226,10 @@ func (ix *Indexer) CatchUp(ctx context.Context, source chain.BlockSource, batchS
 			applied++
 		}
 		total += applied
-		ix.logf("[indexer] 追赶批次 [%d..%d] 应用 %d 块，累计 %d", tipH+1, end, applied, total)
-		if applied == 0 {
-			return total, nil // 无法推进（如源重组中），避免空转
+		ix.logf("[indexer] 追赶批次 [%d..%d] 应用 %d 块，累计 %d", next, end, applied, total)
+		next = end + 1
+		if applied == 0 && next > srcTipH {
+			return total, nil // 已拉到源 tip 仍无法推进，避免空转
 		}
 	}
 }
