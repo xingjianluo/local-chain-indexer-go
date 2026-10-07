@@ -19,6 +19,12 @@ type Indexer struct {
 	// maxReorgDepth 是允许的最大重组深度；落后于此深度的区块
 	// 会被以 ReasonHeightRegression 明确拒绝，同时给分叉池内存一个上界。
 	maxReorgDepth uint64
+	// maxReconcileDepth 是对账时允许回滚的最大本地高度数；
+	// 本地与源的差异超过它时，Reconcile 以 KindDivergenceTooDeep 明确失败。
+	maxReconcileDepth uint64
+	// reconcileRetries 是对账过程中源（或本地）持续变动时的最大重试次数，
+	// 耗尽后以 KindSourceUnstable 明确失败，不会无限重试。
+	reconcileRetries int
 }
 
 // Option 是 Indexer 的可选配置。
@@ -29,9 +35,20 @@ func WithMaxReorgDepth(d uint64) Option {
 	return func(ix *Indexer) { ix.maxReorgDepth = d }
 }
 
+// WithMaxReconcileDepth 设置对账时允许回滚的最大本地高度数（默认 256）。
+// 本地与源的差异超过它时，Reconcile 以 KindDivergenceTooDeep 失败且不动状态。
+func WithMaxReconcileDepth(d uint64) Option {
+	return func(ix *Indexer) { ix.maxReconcileDepth = d }
+}
+
+// WithReconcileRetries 设置对账过程中源持续变动时的最大重试次数（默认 3）。
+func WithReconcileRetries(n int) Option {
+	return func(ix *Indexer) { ix.reconcileRetries = n }
+}
+
 // New 创建一个空索引器。
 func New(opts ...Option) *Indexer {
-	ix := &Indexer{st: newStore(), maxReorgDepth: 128}
+	ix := &Indexer{st: newStore(), maxReorgDepth: 128, maxReconcileDepth: 256, reconcileRetries: 3}
 	for _, o := range opts {
 		o(ix)
 	}
