@@ -39,6 +39,27 @@ func newStore() *store {
 	}
 }
 
+// cloneStore 深拷贝一份 store，作为对账期间的影子状态：
+// 在其上回滚/重放不影响对读者可见的现役 store，
+// 对账成功后整体换入，失败则直接丢弃。
+// 分叉池不带入克隆——对账改挂新链后，旧链上缓存的分叉块不再有意义。
+func cloneStore(st *store) *store {
+	s := &store{
+		blocks:   append([]chain.Block(nil), st.blocks...),
+		undos:    append([]blockUndo(nil), st.undos...),
+		txIndex:  make(map[chain.Hash]txLocation, len(st.txIndex)),
+		balances: make(map[string]int64, len(st.balances)),
+		forkPool: make(map[chain.Hash]chain.Block),
+	}
+	for k, v := range st.txIndex {
+		s.txIndex[k] = v
+	}
+	for k, v := range st.balances {
+		s.balances[k] = v
+	}
+	return s
+}
+
 // batch 收集一组待提交的变更；只有 commit 才会修改 store。
 type batch struct {
 	st       *store

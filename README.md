@@ -67,14 +67,55 @@
   应用完一批才拉下一批，内存占用 O(batchSize)；处理耗时随区块数线性增长
   （底层都是 O(1) 的 map/切片操作），有测试断言不出现超线性劣化。
 
+## 对账式追赶（自愈）
+
+`CatchUp` 只做"从本地尖端往后顺序补齐"。如果中断期间源自己换了链
+（从中间某高度分叉成另一条链，哪怕新链并不比本地高），`CatchUp` 会卡在
+旧链上：源给的下一个块父哈希对不上本地尖端，投递被 `ReasonParentMismatch`
+拒绝。`Reconcile(src, ReconcileOptions)` 是为这种场景准备的对账式追赶，
+一次调用收敛到源当前的规范链，调用方无需手工回滚或重新投递：
+
+1. **反向扫描找共同祖先**：从本地尖端向下按批（≤ `BatchSize`）比对源在同
+   高度的区块哈希。哈希链接保证某高度哈希一致 ⇒ 该高度之前整条链一致。
+   本地为空时退化为纯追赶，与 `CatchUp` 等价。
+2. **影子上回滚+重放**：克隆当前状态为影子 store，在影子上回滚到共同
+   祖先、再分批拉取源的新链重放。每批驻留内存 ≤ `BatchSize`，
+   反向扫描深度 ≤ `MaxDivergence`，内存占用与源的数据总量无关。
+3. **稳定性复核**：重放完成后重新探测源——尖端之后没有更新区块、共同
+   祖先与尖端哈希都没变，才认为对齐；否则本轮作废、重试下一轮。
+4. **原子换入**：全部对齐后在写锁内一次性换入新状态。任何中途失败
+   （拉取失败、源变动、差异过大）都直接丢弃影子，读者看到的索引一点
+   不动；并发读者全程只能看到完整的旧状态或完整的新状态。
+
+失败原因用 `*ReconcileError` 的 `Reason` 明确区分，不会无限重试或悄悄
+停在错误状态上：
+
+| Reason | 触发条件 |
+|---|---|
+| `ReconcileFetchFailed` | 源拉取返回错误（`Unwrap` 可取底层错误） |
+| `ReconcileDivergenceTooDeep` | 在 `MaxDivergence` 深度内找不到共同祖先 |
+| `ReconcileSourceUnstable` | 源持续变动（或本地被并发写改），`MaxRounds` 轮内始终对不齐 |
+
+`ReconcileOptions`：`BatchSize`（必填，批大小/瞬时内存上界）、
+`MaxDivergence`（允许的最大分叉深度，0 = 默认 1024）、
+`MaxRounds`（最大对账轮数，0 = 默认 3）。成功的 `ReconcileReport`
+报告共同祖先高度、回滚数、新应用数、实际轮数与是否本已一致。
+
+**兼容关系**：`CatchUp` 的行为与老用法完全不变，源没有换链时照常用它
+即可；`Reconcile` 是自愈版本，本地为空时两者等价。对账成功后分叉池
+清空（旧链上缓存的分叉块对新规范链不再有意义）。
+
 ## 本地验证
 
 ```bash
-# 全部单测（含重组、重复/乱序、并发、追赶）
+# 全部单测（含重组、重复/乱序、并发、追赶、对账）
 go test ./... -v
 
 # 并发读写需配合竞态检测
-go test ./indexer/ -race -run TestConcurrentReadWrite -v
+go test ./indexer/ -race -run 'TestConcurrentReadWrite|TestReconcileConcurrentReaders' -v
+
+# 只看对账式追赶的用例（日志可见分叉点、回滚/应用数、失败原因分类）
+go test ./indexer/ -run 'TestReconcile' -v
 ```
 
 测试覆盖与断言：
@@ -89,6 +130,13 @@ go test ./indexer/ -race -run TestConcurrentReadWrite -v
 | `TestConcurrentReadWrite` | 写入（含重组）与多读者并发，快照内链连续性与余额守恒恒成立（`-race`） |
 | `TestCatchUpAfterOutage` | 中断后分批追赶 4900 块，批次大小有上界，结果与顺序索引一致 |
 | `TestCatchUpLinearScaling` | 4 倍数据量下每块耗时不明显劣化 |
+| `TestReconcileAfterSourceChainSwitch` | 中断期间源换成另一条更长的链，一次对账收敛，逐高度状态与源一致，旧链交易全部撤销 |
+| `TestReconcileSourceShorterButDifferent` | 源换链但高度更低，照样纠正到源的链，不会误判为"没有新块" |
+| `TestReconcileAlreadySynced` | 本已一致时对账是空操作 |
+| `TestReconcileDivergenceTooDeep` | 共同祖先超出允许深度：明确报 `divergence-too-deep`，索引保持不动 |
+| `TestReconcileSourceUnstable` | 源每次拉取都在变：有限轮数内报 `source-unstable` 放弃，索引保持不动 |
+| `TestReconcileConcurrentReaders` | 对账换入与并发读者并行，快照内链连续性与余额守恒恒成立（`-race`） |
 
 单测日志会打印触发条件与关键状态变化（拒绝原因、重组前后的尖端、
-追赶批次数与每块耗时等），`go test -v` 可见。
+追赶批次数与每块耗时、对账的共同祖先/回滚数/应用数/失败原因等），
+`go test -v` 可见。
